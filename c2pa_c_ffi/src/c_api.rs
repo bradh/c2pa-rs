@@ -88,6 +88,11 @@ mod cbindgen_fix {
     #[repr(C)]
     #[allow(dead_code)]
     pub struct C2paSettings;
+
+    #[cfg(target_arch = "wasm32")]
+    #[repr(C)]
+    #[allow(dead_code)]
+    pub struct C2paHttpResolver;
 }
 
 type C2paContextBuilder = Context;
@@ -216,6 +221,131 @@ pub type SignerCallback = unsafe extern "C" fn(
     signed_bytes: *mut c_uchar,
     signed_len: usize,
 ) -> isize;
+
+/// Callback type for custom HTTP request resolution on wasm32/Emscripten.
+///
+/// Called by Rust when an HTTP request needs to be made (remote manifest fetch,
+/// OCSP, timestamp, etc.). Always called synchronously on the wasm32 thread.
+///
+/// Parameters:
+///   `context`           — User-defined opaque pointer passed unmodified to each call
+///   `url`               — NULL-terminated UTF-8 URL string
+///   `method`            — NULL-terminated HTTP method (e.g. "GET", "POST")
+///   `headers`           — NULL-terminated newline-delimited "Name: Value\n" pairs
+///   `request_body`      — Request body bytes, or NULL if none
+///   `request_body_len`  — Length of request body in bytes
+///   `response_data`     — Rust-allocated buffer; write response body here
+///   `response_capacity` — Size of `response_data` buffer in bytes
+///   `response_status`   — OUT: set to HTTP status code (e.g. 200)
+///
+/// Returns:
+///   >= 0  Number of bytes written to `response_data`
+///   < 0   Error — call `c2pa_error_set_last()` before returning.
+///          If `abs(return) > response_capacity`, Rust retries with the
+///          absolute value as the new buffer capacity.
+#[cfg(target_arch = "wasm32")]
+pub type C2paHttpResolverCallback = unsafe extern "C" fn(
+    context: *mut c_void,
+    url: *const c_char,
+    method: *const c_char,
+    headers: *const c_char,
+    request_body: *const c_uchar,
+    request_body_len: usize,
+    response_data: *mut c_uchar,
+    response_capacity: usize,
+    response_status: *mut i32,
+) -> i32;
+
+/// Internal wasm32-only struct that wraps a C callback as a `SyncHttpResolver`.
+#[cfg(target_arch = "wasm32")]
+struct CHttpResolver {
+    context: *const c_void,
+    callback: C2paHttpResolverCallback,
+}
+
+// No unsafe impl Send/Sync needed: on wasm32, MaybeSend/MaybeSync are
+// blanket-implemented for all types (see maybe_send_sync.rs).
+
+#[cfg(target_arch = "wasm32")]
+impl c2pa::http::SyncHttpResolver for CHttpResolver {
+    fn http_resolve(
+        &self,
+        request: c2pa::http::http::Request<Vec<u8>>,
+    ) -> Result<
+        c2pa::http::http::Response<Box<dyn std::io::Read>>,
+        c2pa::http::HttpResolverError,
+    > {
+        use std::ffi::CString;
+
+        use c2pa::http::HttpResolverError;
+
+        let uri_cstr = CString::new(request.uri().to_string())
+            .map_err(|e| HttpResolverError::Other(Box::new(e)))?;
+        let method_cstr = CString::new(request.method().as_str())
+            .map_err(|e| HttpResolverError::Other(Box::new(e)))?;
+
+        let headers_str: String = request
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| v.to_str().ok().map(|v| format!("{k}: {v}\n")))
+            .collect();
+        let headers_cstr = CString::new(headers_str)
+            .map_err(|e| HttpResolverError::Other(Box::new(e)))?;
+
+        let body = request.into_body();
+        let (body_ptr, body_len) = if body.is_empty() {
+            (std::ptr::null(), 0usize)
+        } else {
+            (body.as_ptr(), body.len())
+        };
+
+        let mut capacity: usize = 64 * 1024;
+        loop {
+            let mut buf: Vec<u8> = vec![0u8; capacity];
+            let mut status_code: i32 = 0;
+
+            let written = unsafe {
+                (self.callback)(
+                    self.context as *mut c_void,
+                    uri_cstr.as_ptr(),
+                    method_cstr.as_ptr(),
+                    headers_cstr.as_ptr(),
+                    body_ptr,
+                    body_len,
+                    buf.as_mut_ptr(),
+                    capacity,
+                    &mut status_code,
+                )
+            };
+
+            if written < 0 {
+                let needed = (-written) as usize;
+                if needed > capacity {
+                    capacity = needed;
+                    continue;
+                }
+                let msg = CimplError::last_message()
+                    .unwrap_or_else(|| "HTTP callback returned error".to_string());
+                return Err(HttpResolverError::Io(std::io::Error::other(msg)));
+            }
+
+            buf.truncate(written as usize);
+            let response = c2pa::http::http::Response::builder()
+                .status(status_code as u16)
+                .body(Box::new(std::io::Cursor::new(buf)) as Box<dyn std::io::Read>)
+                .map_err(HttpResolverError::Http)?;
+            return Ok(response);
+        }
+    }
+}
+
+/// Opaque handle for a wasm32 C-callback-based HTTP resolver.
+/// Created by `c2pa_http_resolver_create()`. Either consumed by
+/// `c2pa_context_builder_set_http_resolver()` or freed via `c2pa_free()`.
+#[cfg(target_arch = "wasm32")]
+pub struct C2paHttpResolver {
+    inner: CHttpResolver,
+}
 
 // // Internal routine to return a rust String reference to C as *mut c_char.
 // // The returned value MUST be released by calling release_string
@@ -491,6 +621,59 @@ pub unsafe extern "C" fn c2pa_context_builder_set_signer(
     untrack_or_return_int!(signer_ptr, C2paSigner);
     let c2pa_signer = Box::from_raw(signer_ptr);
     let result = builder.set_signer(c2pa_signer.signer);
+    ok_or_return_int!(result);
+    0
+}
+
+/// Creates a new async HTTP resolver backed by a C callback (wasm32 only).
+///
+/// The `context` pointer is passed unmodified to every callback invocation and
+/// must remain valid for the lifetime of the resolver and any context built from it.
+///
+/// # Safety
+///
+/// * `callback` must be a valid function pointer that remains valid for the
+///   lifetime of the resolver.
+/// * `context` must remain valid for the lifetime of the resolver and any
+///   context that uses it.
+///
+/// # Returns
+///
+/// A new `C2paHttpResolver*`, or NULL on error. Must be freed with `c2pa_free()`
+/// OR consumed by `c2pa_context_builder_set_http_resolver()`.
+#[cfg(target_arch = "wasm32")]
+#[no_mangle]
+pub unsafe extern "C" fn c2pa_http_resolver_create(
+    context: *const c_void,
+    callback: C2paHttpResolverCallback,
+) -> *mut C2paHttpResolver {
+    box_tracked!(C2paHttpResolver {
+        inner: CHttpResolver { context, callback },
+    })
+}
+
+/// Sets a custom HTTP resolver on the context builder (wasm32 only).
+///
+/// The builder takes ownership of the resolver; the caller must NOT free it afterward.
+///
+/// # Safety
+///
+/// * `builder` must be a valid C2paContextBuilder pointer (not yet built).
+/// * `resolver_ptr` is consumed and must not be used or freed afterward.
+///
+/// # Returns
+///
+/// 0 on success, -1 on error.
+#[cfg(target_arch = "wasm32")]
+#[no_mangle]
+pub unsafe extern "C" fn c2pa_context_builder_set_http_resolver(
+    builder: *mut C2paContextBuilder,
+    resolver_ptr: *mut C2paHttpResolver,
+) -> c_int {
+    let builder = deref_mut_or_return_int!(builder, C2paContextBuilder);
+    untrack_or_return_int!(resolver_ptr, C2paHttpResolver);
+    let c2pa_resolver = Box::from_raw(resolver_ptr);
+    let result = builder.set_resolver(c2pa_resolver.inner);
     ok_or_return_int!(result);
     0
 }
